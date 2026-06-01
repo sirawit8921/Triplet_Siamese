@@ -98,6 +98,8 @@ class RankDataset(Dataset):
             'no_inter_pairs and no_intra_pairs can\'t be both set')
         # preprocess doublets
         self.preprocess_doublets()
+        # pre-build per-dataset sorted index for fast triplet sampling
+        self._build_triplet_index()
         # transform single compounds(+info) into pairs for ranking
         transformed = self._transform_pairwise()
         self.x1_indices = transformed['x1_indices']
@@ -271,7 +273,7 @@ class RankDataset(Dataset):
                 print(f'number of pairs per cluster ({len(clusters)}): min={min(pair_nrs.values())}, max={max(pair_nrs.values())}')
             self.dataset_clusters = clusters
         nr_group_pairs_max = max(list(pair_nrs.values()) + [0])
-        downsample_nr = min(list(pair_nrs.values()) + [np.infty]) * self.downsample_factor
+        downsample_nr = min(list(pair_nrs.values()) + [np.inf]) * self.downsample_factor
         pprint(pair_nrs)
         info('computing pair weights')
         for g in pair_nrs:
@@ -291,7 +293,7 @@ class RankDataset(Dataset):
                     else:
                         weights[i] = None
                         continue
-                rt_diff = (np.infty if isinstance(g, tuple) # no statement can be made for inter-group pairs
+                rt_diff = (np.inf if isinstance(g, tuple) # no statement can be made for inter-group pairs
                            or not self.use_pair_weights
                            else np.abs(self.y[x1_indices[i]] - self.y[x2_indices[i]]))
                 if self.use_group_weights:
@@ -405,6 +407,24 @@ class RankDataset(Dataset):
             return neg_idx, pos_idx, (-1 if y_neg else 0)
 
 
+    def _build_triplet_index(self):
+        """Pre-build per-dataset sorted arrays for O(log N) triplet candidate lookup."""
+        from collections import defaultdict
+        ds_to_indices = defaultdict(list)
+        if self.dataset_info is not None:
+            for i, ds in enumerate(self.dataset_info):
+                ds_to_indices[ds].append(i)
+        else:
+            ds_to_indices['unk'] = list(range(len(self.y)))
+        self._triplet_ds_indices = {}   # ds -> np.array of indices sorted by RT
+        self._triplet_ds_rts    = {}    # ds -> np.array of RTs (sorted)
+        for ds, idxs in ds_to_indices.items():
+            arr = np.array(idxs)
+            rts = self.y[arr]
+            order = np.argsort(rts)
+            self._triplet_ds_indices[ds] = arr[order]
+            self._triplet_ds_rts[ds]     = rts[order]
+
     def preprocess_doublets(self):
         doublet_rt_ranges = {}  # {(ds, id_): (1.2, 2.1)}
         for i in range(len(self.y)):
@@ -479,14 +499,60 @@ class RankDataset(Dataset):
     def __len__(self):
         return self.y_trans.shape[0]
 
-    def __getitem__(self, index):
-        # x1_sys == x2_sys for the first `x_info_global_num` features
-        # returns ((graph, extra, sys) x 2, y, weight)
-        return (((self.x_mols[self.x1_indices[index]], self.x_extra[self.x1_indices[index]],
-                  self.x_sys[self.x1_indices[index]]),
-                 (self.x_mols[self.x2_indices[index]], self.x_extra[self.x2_indices[index]],
-                  self.x_sys[self.x2_indices[index]])),
+    def __getitem__(self, index, _retry=0):
+        if _retry > 10:
+            # give up on triplet, fall back to pair-only (no triplet columns)
+            anchor_idx   = self.x1_indices[index]
+            positive_idx = self.x2_indices[index]
+            return (((self.x_mols[anchor_idx],   self.x_extra[anchor_idx],   self.x_sys[anchor_idx]),
+                     (self.x_mols[positive_idx], self.x_extra[positive_idx], self.x_sys[positive_idx])),
+                    self.y_trans[index], self.weights[index], self.is_confl[index])
+
+        # anchor
+        anchor_idx = self.x1_indices[index]
+        anchor_ds  = self.dataset_info[anchor_idx] if self.dataset_info is not None else 'unk'
+        rt_anchor  = self.y[anchor_idx]
+
+        ds_idxs = self._triplet_ds_indices[anchor_ds]
+        ds_rts  = self._triplet_ds_rts[anchor_ds]
+
+        # positive: |RT - rt_anchor| < 2.0, exclude self
+        lo = np.searchsorted(ds_rts, rt_anchor - 2.0, side='left')
+        hi = np.searchsorted(ds_rts, rt_anchor + 2.0, side='right')
+        pos_mask = ds_idxs[lo:hi]
+        pos_mask = pos_mask[pos_mask != anchor_idx]
+
+        if len(pos_mask) == 0:
+            return self.__getitem__(np.random.randint(len(self.x1_indices)), _retry=_retry + 1)
+
+        positive_idx = np.random.choice(pos_mask)
+
+        # negative: 5.0 < |RT - rt_anchor| < 20.0, pick from up to 20 closest
+        lo_n = np.searchsorted(ds_rts, rt_anchor - 20.0, side='left')
+        hi_n = np.searchsorted(ds_rts, rt_anchor + 20.0, side='right')
+        neg_mask = ds_idxs[lo_n:hi_n]
+        rt_diff  = np.abs(ds_rts[lo_n:hi_n] - rt_anchor)
+        valid    = (rt_diff > 5.0) & (neg_mask != anchor_idx) & (neg_mask != positive_idx)
+        neg_mask = neg_mask[valid]
+        rt_diff  = rt_diff[valid]
+
+        if len(neg_mask) == 0:
+            return self.__getitem__(np.random.randint(len(self.x1_indices)), _retry=_retry + 1)
+
+        # take 20 closest negatives
+        order = np.argsort(rt_diff)[:20]
+        neg_mask = neg_mask[order]
+        negative_idx = np.random.choice(neg_mask)
+
+        return (((self.x_mols[anchor_idx], self.x_extra[anchor_idx],
+                self.x_sys[anchor_idx]),
+                (self.x_mols[positive_idx], self.x_extra[positive_idx],
+                self.x_sys[positive_idx]),
+                (self.x_mols[negative_idx], self.x_extra[negative_idx],
+                self.x_sys[negative_idx])),
                 self.y_trans[index], self.weights[index], self.is_confl[index])
+
+
 
 def check_integrity(x: RankDataset, clean=False):
     pairs = {}

@@ -54,11 +54,11 @@ def none_arg(none_arg):
 
 class TrainArgs(Tap):
     input: List[str]            # Either CSV or dataset ids
-    model_type: Literal['mpn'] = 'mpn'
+    model_type: Literal['mpn'] = 'mpn' # message passing network
     feature_type: Literal['None', 'rdkall', 'rdk2d', 'rdk3d'] = 'None' # type of features to use
     # training
     gpu: bool = False
-    batch_size: int = 512
+    batch_size: int = 128
     epochs: int = 10
     early_stopping_patience: Optional[int] = None # stop training when val loss doesn't improve for this number of times
     test_split: float = 0                         # not needed when testing on exclusive test datasets afterwards
@@ -68,7 +68,7 @@ class TrainArgs(Tap):
     remove_test_compounds_mode: Literal['exact', '2d'] = '2d' # remove exact structures or those with same canonical SMILES
     remove_test_compounds_rarest: bool = False # only remove rarest 50 percent of test compounds
     exclude_compounds_list: Optional[str] = None # list of compounds to exclude from training
-    learning_rate: float = 5e-4
+    learning_rate: float = 1e-5
     adaptive_learning_rate: bool = False
     no_encoder_train: bool = False # don't train the encoder(embedding) layers
     # data
@@ -115,7 +115,7 @@ class TrainArgs(Tap):
     tanaka_match: Literal['best_match', 'exact'] = 'best_match' # 'exact': only allow tanaka parameters with the matching particle size
     tanaka_ignore_spp_particle_size: bool = True
     # model general
-    sizes: List[int] = [256, 65] # hidden layer sizes for ranking: [mol, sysxmol] -> ROI
+    sizes: List[int] = [512, 256, 128] # hidden layer sizes for ranking: [mol, sysxmol] -> ROI
     sizes_sys: List[int] = [256, 256] # hidden layer sizes for system feature vs. molecule encoding
     encoder_size: int = 512 # MPNencoder size
     mpn_depth: int = 3      # Number of message-passing steps
@@ -124,7 +124,7 @@ class TrainArgs(Tap):
     dropout_rate_rank: float = 0.0   # final ranking layers dropout rate
     # mpn model
     mpn_loss: Literal['margin', 'bce'] = 'margin'
-    mpn_margin: float = 0.1
+    mpn_margin: float = 0.5
     mpn_encoder: Literal['dmpnn'] = 'dmpnn'
     smiles_for_graphs: bool = False # always use SMILES internally, compute graphs only on demand
     mpn_no_residual_connections_encoder: bool = False # last stack for mpn model only takes the encoding convolved with sys features
@@ -245,7 +245,12 @@ if __name__ == '__main__':
         from mpnranker2 import MPNranker, train as mpn_train
         import torch
         if (args.gpu):
-            torch.set_default_device('cuda')
+            if torch.cuda.is_available():
+                torch.set_default_device('cuda')
+            elif torch.backends.mps.is_available():
+                torch.set_default_device('mps')
+            else:
+                print('WARNING: --gpu set but no CUDA/MPS found, using CPU', file=sys.stderr)
         print('torch device:', torch.tensor([1.2, 3.4]).device, file=sys.stderr)
         graphs = True
     else:
@@ -457,10 +462,10 @@ if __name__ == '__main__':
     else:
         sampler_train = sampler_val = None
     trainloader = DataLoader(traindata, args.batch_size, shuffle=(not args.sample), sampler=sampler_train,
-                             generator=torch.Generator(device='cuda' if args.gpu else 'cpu'),
+                             generator=torch.Generator(device=torch.get_default_device()),
                              collate_fn=custom_collate)
     valloader = DataLoader(valdata, args.batch_size, shuffle=(not args.sample), sampler=sampler_val,
-                           generator=torch.Generator(device='cuda' if args.gpu else 'cpu'),
+                           generator=torch.Generator(device=torch.get_default_device()),
                            collate_fn=custom_collate) if len(valdata) > 0 else None
     if ('ranker' not in vars() or ranker is None):    # otherwise loaded already
         if (args.model_type == 'mpn'):

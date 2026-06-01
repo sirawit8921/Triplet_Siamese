@@ -76,17 +76,20 @@ class MPNranker(nn.Module):
 
     def forward(self, batch):
         """(1|2|n) x [batch_size x (smiles|graphs), batch_size x extra_features, batch_size x sys_features]"""
+        # unpack x from (x,y,w,confl) structure if needed
+        if len(batch) == 4:
+            batch = batch[0]
         res = []                          # TODO: no lists, just tensor stuff
         for graphs, extra, sysf in batch:       # normally 1 or 2
             if (self.encoder.name == 'dmpnn'):
-                enc = self.encoder([graphs]) # [batch_size x encoder size]
+                enc = self.encoder([graphs]) # [batch_size x encoder size] [encoder rep]
             else:
                 raise NotImplementedError(f'{self.encoder} encoder')
             if (not (hasattr(self, 'no_sys_layers') and self.no_sys_layers)):
                 # encode system x molecule relationships
                 if (hasattr(self, 'sys_blowup') and self.sys_blowup):
                     sysf = F.relu(self.sys_blowup_layer(sysf))
-                enc_pv = torch.cat([enc, extra, sysf], 1)
+                enc_pv = torch.cat([enc, extra, sysf], 1) 
                 for h in self.hidden_pv:
                     enc_pv = F.relu(h(enc_pv))
                 # apply dropout to last pv layer
@@ -104,15 +107,21 @@ class MPNranker(nn.Module):
             # apply dropout to last ranking layer
             enc = self.dropout_rank(enc)
             # single ROI value
+            embedding = F.normalize(enc, p=2, dim=1)
             roi = self.ident(enc)
-            res.append(roi.transpose(0, 1)[0])      # [batch_size]
-        if (len(res) > 2):
-            raise Exception('only one or two molecules are supported for now, not ', len(res))
+
+            if torch.rand(1).item() < 0.001:
+                print(f'ROI mean: {roi.mean().item():.4f}  std: {roi.std().item():.4f}')
+
+            res.append({'embedding': embedding,
+                       'roi':roi.transpose(0, 1)[0]})      # [batch_size]
+        if (len(res) > 3):
+            raise Exception('only up to three molecules are supported, not ', len(res))
         # return torch.sigmoid(res[0] - res[1] if len(res) == 2 else res[0])
         if (hasattr(self, 'no_sigmoid_roi') and self.no_sigmoid_roi):
             return res
         else:
-            return [torch.sigmoid(r) for r in res]
+            return res
 
     def predict(self, graphs, extra, sysf, batch_size=8192,
                 prog_bar=False, ret_features=False):
@@ -139,7 +148,7 @@ class MPNranker(nn.Module):
                          default_convert(sysf[start:end]))
                 # if (input('pdb') == 'y'):
                 #     import pdb; pdb.set_trace()
-                preds.append(self((batch, ))[0].cpu().detach().numpy())
+                preds.append(self((batch, ))[0]['roi'].cpu().detach().numpy())
                 if (ret_features):
                     if (isinstance(graphs[0], str)):
                         features.extend([self.encoder([[g]]) for g in graphs[start:end]])
@@ -148,13 +157,40 @@ class MPNranker(nn.Module):
         if (ret_features):
             return np.concatenate(preds), np.concatenate(features)
         return np.concatenate(preds)
-    def loss_step(self, x, y, weights, loss_fun):
+    def loss_step(self, x, y, weights, ranking_loss_fun, triplet_loss_fun=None):
         pred = self(x)
-        if isinstance(loss_fun, nn.MarginRankingLoss):
-            loss = ((loss_fun(*pred, y) * weights).mean(), loss_fun(*pred, y) * weights)
-        else:
-            loss = ((loss_fun(pred, y) * weights).mean(), loss_fun(pred, y) * weights)
-        return loss
+
+        # ranking loss
+        roi_a = pred[0]['roi']
+        roi_p = pred[1]['roi']
+
+        per_pair_loss = ranking_loss_fun(roi_a, roi_p, y) * weights
+        ranking_loss = per_pair_loss.mean()
+
+        total_loss = ranking_loss
+
+        # triplet loss with fixed margin
+        if triplet_loss_fun is not None and len(pred) == 3:
+            anchor   = pred[0]['embedding']
+            positive = pred[1]['embedding']
+            negative = pred[2]['embedding']
+
+            triplet_loss = triplet_loss_fun(anchor, positive, negative)
+
+            if torch.rand(1).item() < 0.005:   # log ~0.5% of batches
+                d_ap = torch.norm(anchor - positive, dim=1)
+                d_an = torch.norm(anchor - negative, dim=1)
+                print(
+                    f'AP: {d_ap.mean().item():.4f}  AN: {d_an.mean().item():.4f}'
+                    f'  GAP: {(d_an - d_ap).mean().item():.4f}'
+                    f'  TripletAcc: {(d_ap < d_an).float().mean().item():.3f}'
+                )
+                print(f'Ranking Loss: {ranking_loss.item():.4f}  Triplet Loss: {triplet_loss.item():.4f}')
+
+            total_loss = ranking_loss + 0.1 * triplet_loss
+
+        # loss[1] must be per-sample tensor so the train loop can index by is_confl
+        return total_loss, per_pair_loss.detach()
 
 
 def train(ranker: MPNranker, bg: DataLoader, epochs=2,
@@ -187,20 +223,25 @@ def train(ranker: MPNranker, bg: DataLoader, epochs=2,
     # loss_fun = nn.BCEWithLogitsLoss(reduction='none')
     # loss_fun = nn.BCELoss(reduction='none')
     loss_fun = nn.MarginRankingLoss(margin_loss, reduction='none')
+    triplet_loss_fun = nn.TripletMarginLoss(
+        margin=1.0,
+        p=2
+    )
     if (sigmoid_loss):
         warning('sigmoid loss is not implemented anymore! margin loss will be used')
     ranker.train()
     loss_sum = iter_count = val_loss_sum = val_iter_count = val_pat = confl_loss_sum = 0
-    last_val_step = np.infty
+    last_val_step = np.inf
     stop = False
     val_stats, train_stats = {}, {}
     for epoch in range(epochs_start, epochs_start + epochs):
         if stop:                # CTRL+C
             break
         loop = tqdm(bg)
-        for x, y, weights, is_confl in loop:
+        for batch_data in loop:
+            x, y, weights, is_confl = batch_data[:4]
             ranker.zero_grad()
-            loss = ranker.loss_step(x, y, weights, loss_fun)
+            loss = ranker.loss_step(x, y, weights, loss_fun, triplet_loss_fun)
             loss_sum += loss[0].item()
             iter_count += 1
             loss[0].backward()
@@ -234,8 +275,9 @@ def train(ranker: MPNranker, bg: DataLoader, epochs=2,
                 and iter_count % steps_val_loss == (steps_val_loss - 1)):
                 ranker.eval()
                 with torch.no_grad():
-                    for x, y, weights, is_confl in val_g:
-                        val_loss_sum += ranker.loss_step(x, y, weights, loss_fun)[0].item()
+                    for val_batch in val_g:
+                        x, y, weights, is_confl = val_batch[:4]
+                        val_loss_sum += ranker.loss_step(x, y, weights, loss_fun, triplet_loss_fun)[0].item()
                         val_iter_count += 1
                 val_step = val_loss_sum / val_iter_count
                 val_writer.add_scalar('loss', val_step, iter_count)
@@ -347,18 +389,32 @@ def train(ranker: MPNranker, bg: DataLoader, epochs=2,
         ranker.train()
 
 def custom_collate(batch):
-    return (                    # x, y, weights, is_confl
-                (
-                    (custom_collate.graph_batch([_[0][0][0] for _ in batch]),
-                     torch.stack(list(map(default_convert, [_[0][0][1] for _ in batch])), 0),
-                     torch.stack(list(map(default_convert, [_[0][0][2] for _ in batch])), 0)),
-                    (custom_collate.graph_batch([_[0][1][0] for _ in batch]),
-                     torch.stack(list(map(default_convert, [_[0][1][1] for _ in batch])), 0),
-                     torch.stack(list(map(default_convert, [_[0][1][2] for _ in batch])), 0))
-                ),
-                torch.stack(list(map(default_convert, [_[1] for _ in batch])), 0),
-                torch.stack(list(map(default_convert, [_[2] for _ in batch])), 0),
-                torch.stack(list(map(default_convert, [_[3] for _ in batch])), 0))
+    # all items must have triplet; if any fell back to pair, treat whole batch as pairs
+    has_triplet = all(len(item[0]) == 3 for item in batch)
+
+    mols = [                   # x, y, weights, is_confl[, triplet_weight]
+                (custom_collate.graph_batch([_[0][0][0] for _ in batch]),
+                    torch.stack(list(map(default_convert, [_[0][0][1] for _ in batch])), 0),
+                    torch.stack(list(map(default_convert, [_[0][0][2] for _ in batch])), 0)),
+                (custom_collate.graph_batch([_[0][1][0] for _ in batch]),
+                    torch.stack(list(map(default_convert, [_[0][1][1] for _ in batch])), 0),
+                    torch.stack(list(map(default_convert, [_[0][1][2] for _ in batch])), 0))
+    ]
+    if has_triplet:
+        mols.append(
+            (
+                custom_collate.graph_batch([_[0][2][0] for _ in batch]),
+                torch.stack(list(map(default_convert, [_[0][2][1] for _ in batch])), 0),
+                torch.stack(list(map(default_convert, [_[0][2][2] for _ in batch])), 0)
+            )
+        )
+    result = (
+        tuple(mols),
+        torch.stack(list(map(default_convert, [_[1] for _ in batch])), 0),
+        torch.stack(list(map(default_convert, [_[2] for _ in batch])), 0),
+        torch.stack(list(map(default_convert, [_[3] for _ in batch])), 0),
+    )
+    return result
 
 def custom_collate_single(batch):
     transformed = ((custom_collate_single.graph_batch([_[0][0] for _ in batch]),

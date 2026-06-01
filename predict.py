@@ -66,6 +66,22 @@ if __name__ == '__main__':
     # load model
     info('load model...')
     model = load_model(args.model, all_in_one=True)
+    import torch.nn as nn
+
+    def patch_dropout(model):
+        try:
+            # chemprop encoder structure
+            encoders = model.encoder.encoder
+
+            for enc in encoders:
+                if not hasattr(enc, 'dropout_layer'):
+                    enc.dropout_layer = nn.Dropout(p=0.0)
+
+            print("Dropout patch applied (MPNEncoder only)")
+        except Exception as e:
+            print("Patch failed:", e)
+
+    patch_dropout(model)
     data_args = model.extra_storage['data_args']
     data_args['repo_root_folder'] =  args.repo_root_folder
     sysfeature_scaler = model.extra_storage['sysfeature_scaler']
