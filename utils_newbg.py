@@ -516,9 +516,15 @@ class RankDataset(Dataset):
         ds_idxs = self._triplet_ds_indices[anchor_ds]
         ds_rts  = self._triplet_ds_rts[anchor_ds]
 
-        # positive: |RT - rt_anchor| < 2.0, exclude self
-        lo = np.searchsorted(ds_rts, rt_anchor - 2.0, side='left')
-        hi = np.searchsorted(ds_rts, rt_anchor + 2.0, side='right')
+        # relative bounds based on dataset RT range
+        rt_range   = float(max(ds_rts[-1] - ds_rts[0], 1e-6))
+        pos_window = 0.05 * rt_range   # positive: within 5% of RT range
+        neg_lower  = 0.05 * rt_range   # negative lower bound: 5% of RT range
+        neg_upper  = 0.50 * rt_range   # negative upper bound: 50% of RT range
+
+        # positive: |RT - rt_anchor| < pos_window, exclude self
+        lo = np.searchsorted(ds_rts, rt_anchor - pos_window, side='left')
+        hi = np.searchsorted(ds_rts, rt_anchor + pos_window, side='right')
         pos_mask = ds_idxs[lo:hi]
         pos_mask = pos_mask[pos_mask != anchor_idx]
 
@@ -527,22 +533,27 @@ class RankDataset(Dataset):
 
         positive_idx = np.random.choice(pos_mask)
 
-        # negative: 5.0 < |RT - rt_anchor| < 20.0, pick from up to 20 closest
-        lo_n = np.searchsorted(ds_rts, rt_anchor - 20.0, side='left')
-        hi_n = np.searchsorted(ds_rts, rt_anchor + 20.0, side='right')
+        # negative: neg_lower < |RT - rt_anchor| < neg_upper, pick from up to 20 closest
+        lo_n = np.searchsorted(ds_rts, rt_anchor - neg_upper, side='left')
+        hi_n = np.searchsorted(ds_rts, rt_anchor + neg_upper, side='right')
         neg_mask = ds_idxs[lo_n:hi_n]
         rt_diff  = np.abs(ds_rts[lo_n:hi_n] - rt_anchor)
-        valid    = (rt_diff > 5.0) & (neg_mask != anchor_idx) & (neg_mask != positive_idx)
+        valid    = (rt_diff > neg_lower) & (neg_mask != anchor_idx) & (neg_mask != positive_idx)
         neg_mask = neg_mask[valid]
         rt_diff  = rt_diff[valid]
 
         if len(neg_mask) == 0:
             return self.__getitem__(np.random.randint(len(self.x1_indices)), _retry=_retry + 1)
 
-        # take 20 closest negatives
+        # take 20 closest negatives (semi-hard mining)
         order = np.argsort(rt_diff)[:20]
         neg_mask = neg_mask[order]
         negative_idx = np.random.choice(neg_mask)
+
+        # adaptive margin: |RT_P - RT_N| / rt_range, no clip
+        rt_positive    = self.y[positive_idx]
+        rt_negative    = self.y[negative_idx]
+        adaptive_margin = np.float32(abs(rt_positive - rt_negative) / rt_range)
 
         return (((self.x_mols[anchor_idx], self.x_extra[anchor_idx],
                 self.x_sys[anchor_idx]),
@@ -550,7 +561,8 @@ class RankDataset(Dataset):
                 self.x_sys[positive_idx]),
                 (self.x_mols[negative_idx], self.x_extra[negative_idx],
                 self.x_sys[negative_idx])),
-                self.y_trans[index], self.weights[index], self.is_confl[index])
+                self.y_trans[index], self.weights[index], self.is_confl[index],
+                adaptive_margin)
 
 
 

@@ -78,7 +78,7 @@ def load_model(path):
             'sys_scales', 'solvent_order',
         }
         data_args  = {k: v for k, v in vars(saved_data).items() if k in DATA_ARG_KEYS}
-        scaler     = saved_data.sysfeature_scaler
+        scaler     = getattr(saved_data, 'sysfeature_scaler', None)
     return model, data_args, scaler
 
 

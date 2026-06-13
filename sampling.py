@@ -9,11 +9,19 @@ import torch
 class CustomWeightedRandomSampler(WeightedRandomSampler):
     """WeightedRandomSampler except allows for more than 2^24 samples to be sampled"""
     def __init__(self, weights, *args, **kwargs):
-        # WeightedRandomSampler forces float64 which MPS doesn't support
-        # — pass CPU numpy array to bypass the device check
+        # WeightedRandomSampler forces float64 which MPS doesn't support.
+        # torch.as_tensor inside super().__init__ is intercepted by the MPS
+        # device context even for numpy arrays — temporarily reset to CPU.
         if isinstance(weights, torch.Tensor):
             weights = weights.cpu().numpy()
-        super().__init__(weights, *args, **kwargs)
+        prev_device = torch.get_default_device() if hasattr(torch, 'get_default_device') else None
+        try:
+            if prev_device is not None:
+                torch.set_default_device('cpu')
+            super().__init__(weights, *args, **kwargs)
+        finally:
+            if prev_device is not None:
+                torch.set_default_device(prev_device)
     def __iter__(self):
         rand_tensor = np.random.choice(range(0, len(self.weights)),
                                        size=self.num_samples,

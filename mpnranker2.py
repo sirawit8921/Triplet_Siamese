@@ -14,7 +14,29 @@ from utils import Data
 import numpy as np
 import logging
 from functools import reduce
-from torch.utils.data import default_collate, default_convert
+from torch.utils.data import default_collate
+
+def default_convert(data):
+    """Convert data to float32 tensor on the default device, bypassing MPS float64 incompatibility."""
+    import numpy as np
+    if isinstance(data, torch.Tensor):
+        t = data.float() if data.dtype == torch.float64 else data
+    elif isinstance(data, np.ndarray):
+        t = torch.from_numpy(data.astype(np.float32) if data.dtype == np.float64 else data.copy())
+    elif isinstance(data, (float, np.floating)):
+        t = torch.tensor(float(data), dtype=torch.float32)
+    elif isinstance(data, (int, np.integer, bool)):
+        t = torch.tensor(int(data), dtype=torch.float32)
+    else:
+        t = torch.tensor(data, dtype=torch.float32)
+    # move to default device (e.g. mps) if set
+    try:
+        dev = torch.get_default_device()
+        if dev and str(dev) != 'cpu':
+            t = t.to(dev)
+    except Exception:
+        pass
+    return t
 
 logger = logging.getLogger('2-step.mpnranker2')
 info = logger.info
@@ -86,6 +108,9 @@ class MPNranker(nn.Module):
             else:
                 raise NotImplementedError(f'{self.encoder} encoder')
             if (not (hasattr(self, 'no_sys_layers') and self.no_sys_layers)):
+                # ensure extra/sysf are on same device as enc (e.g. MPS)
+                extra = extra.to(enc.device)
+                sysf  = sysf.to(enc.device)
                 # encode system x molecule relationships
                 if (hasattr(self, 'sys_blowup') and self.sys_blowup):
                     sysf = F.relu(self.sys_blowup_layer(sysf))
@@ -157,29 +182,37 @@ class MPNranker(nn.Module):
         if (ret_features):
             return np.concatenate(preds), np.concatenate(features)
         return np.concatenate(preds)
-    def loss_step(self, x, y, weights, ranking_loss_fun, triplet_loss_fun=None):
+    def loss_step(self, x, y, weights, ranking_loss_fun, triplet_loss_fun=None, triplet_lambda=0.1, per_triplet_margin=None):
         pred = self(x)
 
         # ranking loss
         roi_a = pred[0]['roi']
         roi_p = pred[1]['roi']
 
+        # move labels and weights to same device as model output
+        dev = roi_a.device
+        y       = y.to(dev)
+        weights = weights.to(dev)
+
         per_pair_loss = ranking_loss_fun(roi_a, roi_p, y) * weights
         ranking_loss = per_pair_loss.mean()
 
         total_loss = ranking_loss
 
-        # triplet loss with fixed margin
+        # triplet loss with adaptive margin
         if triplet_loss_fun is not None and len(pred) == 3:
             anchor   = pred[0]['embedding']
             positive = pred[1]['embedding']
             negative = pred[2]['embedding']
 
-            triplet_loss = triplet_loss_fun(anchor, positive, negative)
+            d_ap = torch.norm(anchor - positive, dim=1)
+            d_an = torch.norm(anchor - negative, dim=1)
+
+            # soft margin: log(1 + exp(d_ap - d_an)), no margin hyperparameter needed
+            # ref: Hermans et al. 2017 "In Defense of the Triplet Loss"
+            triplet_loss = torch.log1p(torch.exp(d_ap - d_an)).mean()
 
             if torch.rand(1).item() < 0.005:   # log ~0.5% of batches
-                d_ap = torch.norm(anchor - positive, dim=1)
-                d_an = torch.norm(anchor - negative, dim=1)
                 print(
                     f'AP: {d_ap.mean().item():.4f}  AN: {d_an.mean().item():.4f}'
                     f'  GAP: {(d_an - d_ap).mean().item():.4f}'
@@ -187,7 +220,7 @@ class MPNranker(nn.Module):
                 )
                 print(f'Ranking Loss: {ranking_loss.item():.4f}  Triplet Loss: {triplet_loss.item():.4f}')
 
-            total_loss = ranking_loss + 0.1 * triplet_loss
+            total_loss = ranking_loss + triplet_lambda * triplet_loss
 
         # loss[1] must be per-sample tensor so the train loop can index by is_confl
         return total_loss, per_pair_loss.detach()
@@ -203,7 +236,8 @@ def train(ranker: MPNranker, bg: DataLoader, epochs=2,
           margin_loss=0.1, early_stopping_patience=None,
           ep_save=False, learning_rate=1e-3, adaptive_lr=False,
           gradient_clip=5, no_encoder_train=False,
-          accs=True, confl_images=False, eval_train_all=True):
+          accs=True, confl_images=False, eval_train_all=True,
+          triplet_margin=1.0, triplet_lambda=0.1):
     if (confl_images):
         from rdkit.Chem import Draw
         from PIL import ImageDraw
@@ -224,7 +258,7 @@ def train(ranker: MPNranker, bg: DataLoader, epochs=2,
     # loss_fun = nn.BCELoss(reduction='none')
     loss_fun = nn.MarginRankingLoss(margin_loss, reduction='none')
     triplet_loss_fun = nn.TripletMarginLoss(
-        margin=1.0,
+        margin=triplet_margin,
         p=2
     )
     if (sigmoid_loss):
@@ -240,8 +274,9 @@ def train(ranker: MPNranker, bg: DataLoader, epochs=2,
         loop = tqdm(bg)
         for batch_data in loop:
             x, y, weights, is_confl = batch_data[:4]
+            per_triplet_margin = batch_data[4] if len(batch_data) > 4 else None
             ranker.zero_grad()
-            loss = ranker.loss_step(x, y, weights, loss_fun, triplet_loss_fun)
+            loss = ranker.loss_step(x, y, weights, loss_fun, triplet_loss_fun, triplet_lambda=triplet_lambda, per_triplet_margin=per_triplet_margin)
             loss_sum += loss[0].item()
             iter_count += 1
             loss[0].backward()
@@ -277,7 +312,8 @@ def train(ranker: MPNranker, bg: DataLoader, epochs=2,
                 with torch.no_grad():
                     for val_batch in val_g:
                         x, y, weights, is_confl = val_batch[:4]
-                        val_loss_sum += ranker.loss_step(x, y, weights, loss_fun, triplet_loss_fun)[0].item()
+                        per_triplet_margin_val = val_batch[4] if len(val_batch) > 4 else None
+                        val_loss_sum += ranker.loss_step(x, y, weights, loss_fun, triplet_loss_fun, triplet_lambda=triplet_lambda, per_triplet_margin=per_triplet_margin_val)[0].item()
                         val_iter_count += 1
                 val_step = val_loss_sum / val_iter_count
                 val_writer.add_scalar('loss', val_step, iter_count)
@@ -414,6 +450,9 @@ def custom_collate(batch):
         torch.stack(list(map(default_convert, [_[2] for _ in batch])), 0),
         torch.stack(list(map(default_convert, [_[3] for _ in batch])), 0),
     )
+    if has_triplet and len(batch[0]) > 4:
+        per_triplet_margin = torch.tensor([_[4] for _ in batch], dtype=torch.float32)
+        result = result + (per_triplet_margin,)
     return result
 
 def custom_collate_single(batch):

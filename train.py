@@ -125,6 +125,8 @@ class TrainArgs(Tap):
     # mpn model
     mpn_loss: Literal['margin', 'bce'] = 'margin'
     mpn_margin: float = 0.5
+    triplet_margin: float = 0.5   # margin for TripletMarginLoss (default: same as mpn_margin)
+    triplet_lambda: float = 0.1   # weight of triplet loss in total loss
     mpn_encoder: Literal['dmpnn'] = 'dmpnn'
     smiles_for_graphs: bool = False # always use SMILES internally, compute graphs only on demand
     mpn_no_residual_connections_encoder: bool = False # last stack for mpn model only takes the encoding convolved with sys features
@@ -160,6 +162,7 @@ class TrainArgs(Tap):
     run_name: Optional[str] = None
     export_rois: bool = False
     save_data: bool = False
+    benchmark: bool = False  # run benchmark after training and save results to {run_name}_benchmark.json
     ep_save: bool = False       # save after each epoch
     no_train_acc_all: bool = False # can save memory; this metric is pretty useless anyways
     no_train_acc: bool = False # can save memory; this metric is pretty useless anyways
@@ -504,7 +507,9 @@ if __name__ == '__main__':
                       adaptive_lr=args.adaptive_learning_rate,
                       no_encoder_train=args.no_encoder_train, ep_save=args.ep_save,
                       eval_train_all=(not args.no_train_acc_all),
-                      accs=(not args.no_train_acc))
+                      accs=(not args.no_train_acc),
+                      triplet_margin=args.triplet_margin,
+                      triplet_lambda=args.triplet_lambda)
         else:
             raise NotImplementedError(args.model_type)
     except KeyboardInterrupt:
@@ -526,3 +531,47 @@ if __name__ == '__main__':
     if (args.cache_file is not None and hasattr(features, 'write_cache') and features.write_cache):
         print('writing cache, don\'t interrupt!!')
         pickle.dump(features.cached, open(args.cache_file, 'wb'))
+
+    if args.benchmark and args.save_data:
+        print(f'\n=== Running benchmark for {run_name} ===')
+        from run_benchmark import load_model, run_fold, DATASETS
+        import yaml
+        output_path = f'{run_name}_benchmark.json'
+        model_path  = f'{run_name}.pt'
+        bm_model, data_args, scaler = load_model(model_path)
+        summary, all_results = [], {}
+        for ds_name, ds_id, ds_prefix, gradient_len in DATASETS:
+            meta_path = os.path.join(args.repo_root_folder, 'processed_data',
+                                     ds_id, f'{ds_id}_metadata.yaml')
+            if not os.path.exists(meta_path):
+                print(f'SKIP {ds_name}: metadata not found'); continue
+            for scenario in ['mces_10cv', 'uniform_10cv']:
+                folder_name = f'{ds_prefix}_{scenario}'
+                folder = os.path.join('benchmark_splits', folder_name)
+                if not os.path.isdir(folder):
+                    print(f'SKIP {folder_name}: folder not found'); continue
+                folds = []
+                for fold in range(10):
+                    tr = os.path.join(folder, f'{folder_name}_fold{fold}_train.csv')
+                    te = os.path.join(folder, f'{folder_name}_fold{fold}_test.csv')
+                    if not (os.path.exists(tr) and os.path.exists(te)): continue
+                    r = run_fold(bm_model, data_args, scaler, meta_path,
+                                 pd.read_csv(tr), pd.read_csv(te),
+                                 args.batch_size, args.repo_root_folder)
+                    folds.append(r)
+                    print(f'  {ds_name} {scenario} fold{fold}: MAE={r["mae"]:.3f} min')
+                if not folds: continue
+                mae      = [r['mae']   for r in folds]
+                medae    = [r['medae'] for r in folds]
+                rmse     = [r['rmse']  for r in folds]
+                mae_norm = [r['mae'] / gradient_len * 100 for r in folds]
+                row = {'dataset': ds_name, 'scenario': scenario, 'folds': len(folds),
+                       'MAE (min)':    f'{np.mean(mae):.3f} ± {np.std(mae):.3f}',
+                       'MedAE (min)':  f'{np.mean(medae):.3f} ± {np.std(medae):.3f}',
+                       'RMSE (min)':   f'{np.mean(rmse):.3f} ± {np.std(rmse):.3f}',
+                       'MAE norm (%)': f'{np.mean(mae_norm):.2f} ± {np.std(mae_norm):.2f}'}
+                summary.append(row)
+                all_results[f'{ds_name}/{scenario}'] = folds
+                print(f'>>> {ds_name} [{scenario}]  MAE norm={np.mean(mae_norm):.2f}±{np.std(mae_norm):.2f}%')
+        json.dump({'summary': summary, 'folds': all_results}, open(output_path, 'w'), indent=2)
+        print(f'\nBenchmark saved to {output_path}')
