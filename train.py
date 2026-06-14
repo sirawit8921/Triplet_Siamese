@@ -127,6 +127,8 @@ class TrainArgs(Tap):
     mpn_margin: float = 0.5
     triplet_margin: float = 0.5   # margin for TripletMarginLoss (default: same as mpn_margin)
     triplet_lambda: float = 0.1   # weight of triplet loss in total loss
+    triplet_sigmoid_k: float = 5.0    # sharpness of sigmoid weight (hard/easy triplet boundary)
+    triplet_sigmoid_tau: float = 0.3  # GAP threshold: triplets with GAP < tau are considered hard
     mpn_encoder: Literal['dmpnn'] = 'dmpnn'
     smiles_for_graphs: bool = False # always use SMILES internally, compute graphs only on demand
     mpn_no_residual_connections_encoder: bool = False # last stack for mpn model only takes the encoding convolved with sys features
@@ -509,7 +511,9 @@ if __name__ == '__main__':
                       eval_train_all=(not args.no_train_acc_all),
                       accs=(not args.no_train_acc),
                       triplet_margin=args.triplet_margin,
-                      triplet_lambda=args.triplet_lambda)
+                      triplet_lambda=args.triplet_lambda,
+                      triplet_sigmoid_k=args.triplet_sigmoid_k,
+                      triplet_sigmoid_tau=args.triplet_sigmoid_tau)
         else:
             raise NotImplementedError(args.model_type)
     except KeyboardInterrupt:

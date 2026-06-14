@@ -182,7 +182,8 @@ class MPNranker(nn.Module):
         if (ret_features):
             return np.concatenate(preds), np.concatenate(features)
         return np.concatenate(preds)
-    def loss_step(self, x, y, weights, ranking_loss_fun, triplet_loss_fun=None, triplet_lambda=0.1, per_triplet_margin=None):
+    def loss_step(self, x, y, weights, ranking_loss_fun, triplet_loss_fun=None, triplet_lambda=0.1, per_triplet_margin=None,
+                  triplet_sigmoid_k=5.0, triplet_sigmoid_tau=0.3):
         pred = self(x)
 
         # ranking loss
@@ -199,7 +200,10 @@ class MPNranker(nn.Module):
 
         total_loss = ranking_loss
 
-        # triplet loss with adaptive margin
+        # triplet loss: fixed margin + adaptive margin + sigmoid weight
+        # L = (1/N) * sum_i [ w_i * max(0, d_ap_i - d_an_i + m_i) ]
+        # w_i = sigmoid(k * (tau - GAP_i))   -- hard triplets (small GAP) get high weight
+        # m_i = |RT_P - RT_N| / rt_range     -- adaptive margin from RT difference (domain knowledge)
         if triplet_loss_fun is not None and len(pred) == 3:
             anchor   = pred[0]['embedding']
             positive = pred[1]['embedding']
@@ -208,17 +212,28 @@ class MPNranker(nn.Module):
             d_ap = torch.norm(anchor - positive, dim=1)
             d_an = torch.norm(anchor - negative, dim=1)
 
-            # soft margin: log(1 + exp(d_ap - d_an)), no margin hyperparameter needed
-            # ref: Hermans et al. 2017 "In Defense of the Triplet Loss"
-            triplet_loss = torch.log1p(torch.exp(d_ap - d_an)).mean()
+            GAP = d_an - d_ap
+
+            # sigmoid weight: harder triplets (GAP < tau) get higher weight
+            w = torch.sigmoid(triplet_sigmoid_k * (triplet_sigmoid_tau - GAP))
+
+            # adaptive margin: use per-triplet margin passed from data loader (|RT_P - RT_N| / rt_range)
+            if per_triplet_margin is not None:
+                m = per_triplet_margin.to(dev)
+            else:
+                m = torch.zeros_like(d_ap)
+
+            per_triplet_loss = w * torch.clamp(d_ap - d_an + m, min=0.0)
+            triplet_loss = per_triplet_loss.mean()
 
             if torch.rand(1).item() < 0.005:   # log ~0.5% of batches
                 print(
                     f'AP: {d_ap.mean().item():.4f}  AN: {d_an.mean().item():.4f}'
-                    f'  GAP: {(d_an - d_ap).mean().item():.4f}'
+                    f'  GAP: {GAP.mean().item():.4f}'
                     f'  TripletAcc: {(d_ap < d_an).float().mean().item():.3f}'
                 )
-                print(f'Ranking Loss: {ranking_loss.item():.4f}  Triplet Loss: {triplet_loss.item():.4f}')
+                print(f'Ranking Loss: {ranking_loss.item():.4f}  Triplet Loss: {triplet_loss.item():.4f}'
+                      f'  w_mean: {w.mean().item():.3f}  m_mean: {m.mean().item():.3f}')
 
             total_loss = ranking_loss + triplet_lambda * triplet_loss
 
@@ -237,7 +252,8 @@ def train(ranker: MPNranker, bg: DataLoader, epochs=2,
           ep_save=False, learning_rate=1e-3, adaptive_lr=False,
           gradient_clip=5, no_encoder_train=False,
           accs=True, confl_images=False, eval_train_all=True,
-          triplet_margin=1.0, triplet_lambda=0.1):
+          triplet_margin=1.0, triplet_lambda=0.1,
+          triplet_sigmoid_k=5.0, triplet_sigmoid_tau=0.3):
     if (confl_images):
         from rdkit.Chem import Draw
         from PIL import ImageDraw
@@ -276,7 +292,8 @@ def train(ranker: MPNranker, bg: DataLoader, epochs=2,
             x, y, weights, is_confl = batch_data[:4]
             per_triplet_margin = batch_data[4] if len(batch_data) > 4 else None
             ranker.zero_grad()
-            loss = ranker.loss_step(x, y, weights, loss_fun, triplet_loss_fun, triplet_lambda=triplet_lambda, per_triplet_margin=per_triplet_margin)
+            loss = ranker.loss_step(x, y, weights, loss_fun, triplet_loss_fun, triplet_lambda=triplet_lambda, per_triplet_margin=per_triplet_margin,
+                                        triplet_sigmoid_k=triplet_sigmoid_k, triplet_sigmoid_tau=triplet_sigmoid_tau)
             loss_sum += loss[0].item()
             iter_count += 1
             loss[0].backward()
@@ -313,7 +330,8 @@ def train(ranker: MPNranker, bg: DataLoader, epochs=2,
                     for val_batch in val_g:
                         x, y, weights, is_confl = val_batch[:4]
                         per_triplet_margin_val = val_batch[4] if len(val_batch) > 4 else None
-                        val_loss_sum += ranker.loss_step(x, y, weights, loss_fun, triplet_loss_fun, triplet_lambda=triplet_lambda, per_triplet_margin=per_triplet_margin_val)[0].item()
+                        val_loss_sum += ranker.loss_step(x, y, weights, loss_fun, triplet_loss_fun, triplet_lambda=triplet_lambda, per_triplet_margin=per_triplet_margin_val,
+                                                            triplet_sigmoid_k=triplet_sigmoid_k, triplet_sigmoid_tau=triplet_sigmoid_tau)[0].item()
                         val_iter_count += 1
                 val_step = val_loss_sum / val_iter_count
                 val_writer.add_scalar('loss', val_step, iter_count)
